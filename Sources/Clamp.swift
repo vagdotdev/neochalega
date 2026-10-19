@@ -3,7 +3,7 @@ import Foundation
 /// Hard clamp onto 6 cores. Steps the full error in one sample.
 /// It does not ease, decay, or keep a residual burn after demand drops.
 enum Clamp {
-    static let targetCores = 6.0
+    static var targetCores: Double { Double(NeoSpec.logicalCores) }
 
     static func nextBurn(other: Double, saturated: Bool, holding: Double, maxBurn: Double) -> Double {
         let hold = min(max(0, holding), maxBurn)

@@ -38,7 +38,7 @@ final class Engine: ObservableObject {
     @Published var hostCores: Int = 0
     @Published var hostMemory: UInt64 = 0
 
-    let targetRAM: UInt64 = 8 * 1024 * 1024 * 1024
+    let targetRAM: UInt64 = NeoSpec.memory
     private let box = ThrottleBox()
     private var activity: NSObjectProtocol?
 
@@ -58,7 +58,8 @@ final class Engine: ObservableObject {
             progress = 0
             detail = "Locking memory…"
             beginActivity()
-            box.arm(memory: hostMemory, cores: hostCores, targetRAM: targetRAM) { [weak self] event in
+            SessionLog.write(phase: "arming", detail: "Locking memory…", held: 0, burn: 0, other: 0)
+            box.arm(memory: hostMemory, cores: hostCores) { [weak self] event in
                 DispatchQueue.main.async {
                     self?.apply(event)
                 }
@@ -97,6 +98,7 @@ final class Engine: ObservableObject {
         progress = 0
         phase = .off
         detail = "This Mac is at full speed."
+        SessionLog.write(phase: "off", detail: detail, held: 0, burn: 0, other: 0)
         endActivity()
     }
 
@@ -106,6 +108,7 @@ final class Engine: ObservableObject {
             heldBytes = done
             progress = total == 0 ? 1 : Double(done) / Double(total)
             detail = "Locking \(Self.format(done)) of \(Self.format(total))"
+            SessionLog.write(phase: "arming", detail: detail, held: done, burn: 0, other: 0)
         case .live(let held, let burn, let other):
             if phase == .releasing || phase == .off { return }
             phase = .on
@@ -113,19 +116,21 @@ final class Engine: ObservableObject {
             burnCores = burn
             otherCores = other
             progress = 1
-            if hostMemory <= targetRAM + 256 * 1024 * 1024 {
+            if NeoSpec.holdBytes(hostMemory: hostMemory) == 0 {
                 detail = "Memory is already 8 GB. Core cap is live."
             } else if burn < 0.25 {
                 detail = "8 GB held. Under 6 cores, so one core stays fast."
             } else {
                 detail = "8 GB held. Parallel work is clamped to 6 cores."
             }
+            SessionLog.write(phase: "on", detail: detail, held: held, burn: burn, other: other)
         case .failed(let message):
             heldBytes = 0
             burnCores = 0
             phase = .off
             progress = 0
             detail = message
+            SessionLog.write(phase: "failed", detail: message, held: 0, burn: 0, other: 0)
             endActivity()
         }
     }
@@ -170,7 +175,19 @@ final class Engine: ObservableObject {
         let box = ThrottleBox()
         let sem = DispatchSemaphore(value: 0)
         var failed: String?
-        box.arm(memory: 8 * 1024 * 1024 * 1024 + 32 * 1024 * 1024, cores: 8, targetRAM: 8 * 1024 * 1024 * 1024, holdOverride: 32 * 1024 * 1024) { event in
+        let plan = NeoPlan.current()
+        guard let planData = plan.jsonUTF8(),
+              (try? JSONSerialization.jsonObject(with: planData)) != nil
+        else {
+            fputs("self-test: plan is not json\n", stderr)
+            return 1
+        }
+        let wantsLock = plan.actions.contains { $0.op == "lock_memory" }
+        if wantsLock != (NeoSpec.holdBytes(hostMemory: plan.host.memoryBytes) > 0) {
+            fputs("self-test: plan lock decision does not match NeoSpec\n", stderr)
+            return 1
+        }
+        box.arm(memory: 8 * 1024 * 1024 * 1024 + 32 * 1024 * 1024, cores: 8, holdOverride: 32 * 1024 * 1024) { event in
             if case .failed(let message) = event { failed = message }
             if case .live = event { sem.signal() }
         }
@@ -250,7 +267,7 @@ final class ThrottleBox {
         return epoch
     }
 
-    func arm(memory: UInt64, cores: Int, targetRAM: UInt64, holdOverride: UInt64? = nil, onEvent: @escaping (ThrottleEvent) -> Void) {
+    func arm(memory: UInt64, cores: Int, holdOverride: UInt64? = nil, onEvent: @escaping (ThrottleEvent) -> Void) {
         let token = currentEpoch()
         queue.async { [self] in
             guard currentEpoch() == token else { return }
@@ -258,7 +275,7 @@ final class ThrottleBox {
             cancel = false
             armed = true
             ncpu = max(1, cores)
-            let hold = holdOverride ?? (memory > targetRAM ? memory - targetRAM : 0)
+            let hold = holdOverride ?? NeoSpec.holdBytes(hostMemory: memory)
             if hold > 0 {
                 let ok = lock(hold, token: token, onEvent: onEvent)
                 if !ok || currentEpoch() != token {
@@ -273,7 +290,7 @@ final class ThrottleBox {
                 disarmOnQueue()
                 return
             }
-            let extras = max(0, ncpu - Int(Clamp.targetCores))
+            let extras = max(0, ncpu - NeoSpec.logicalCores)
             if extras > 0 {
                 for _ in 0..<ncpu {
                     let burner = Burner()
@@ -362,7 +379,7 @@ final class ThrottleBox {
             burner.stopAndJoin()
             return true
         }
-        let extras = max(0, ncpu - Int(Clamp.targetCores))
+        let extras = max(0, ncpu - NeoSpec.logicalCores)
         if extras > 0 && burners.count < ncpu {
             let burner = Burner()
             burner.start()
@@ -489,6 +506,8 @@ final class Burner {
 struct MachineInfo {
     var brand: String
     var ncpu: Int
+    var performanceCores: Int
+    var efficiencyCores: Int
     var memory: UInt64
 
     static func current() -> MachineInfo {
@@ -498,6 +517,8 @@ struct MachineInfo {
         var ncpu: Int32 = 0
         var nLen = MemoryLayout<Int32>.size
         sysctlbyname("hw.ncpu", &ncpu, &nLen, nil, 0)
+        let performance = sysctlInt("hw.perflevel0.logicalcpu") ?? Int(ncpu)
+        let efficiency = sysctlInt("hw.perflevel1.logicalcpu") ?? 0
         var brandLen = 0
         sysctlbyname("machdep.cpu.brand_string", nil, &brandLen, nil, 0)
         var brand = "This Mac"
@@ -506,6 +527,19 @@ struct MachineInfo {
             sysctlbyname("machdep.cpu.brand_string", &bytes, &brandLen, nil, 0)
             brand = String(cString: bytes)
         }
-        return MachineInfo(brand: brand, ncpu: Int(ncpu), memory: mem)
+        return MachineInfo(
+            brand: brand,
+            ncpu: Int(ncpu),
+            performanceCores: performance,
+            efficiencyCores: efficiency,
+            memory: mem
+        )
+    }
+
+    private static func sysctlInt(_ name: String) -> Int? {
+        var value: Int32 = 0
+        var len = MemoryLayout<Int32>.size
+        guard sysctlbyname(name, &value, &len, nil, 0) == 0 else { return nil }
+        return Int(value)
     }
 }
